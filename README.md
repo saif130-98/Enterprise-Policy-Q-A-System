@@ -23,7 +23,7 @@ This repository contains a fully local, production-ready Retrieval-Augmented Gen
 * `companyPolicies.txt`: The raw dataset containing the 9 core policy points separated by paragraphs.
 
 ## Local Setup & Deployment
-This project is configured to run efficiently on local hardware (such as an HP Victus 16 with an RTX 4060 GPU) by utilizing `use_safetensors=True` and strict `torch.no_grad()` memory management during inference.
+This project is configured to run efficiently on local hardware by utilizing `use_safetensors=True` and strict `torch.no_grad()` memory management during inference.
 
 1. **Install Dependencies:**
    Ensure Python 3.10+ is installed, then run:
