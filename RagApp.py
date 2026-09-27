@@ -3,10 +3,11 @@ import torch
 import numpy as np
 import random
 import faiss
+import string
 from transformers import (
     DPRContextEncoder, DPRContextEncoderTokenizer,
     DPRQuestionEncoder, DPRQuestionEncoderTokenizer,
-    AutoTokenizer, AutoModelForCausalLM
+    AutoTokenizer, AutoModelForSeq2SeqLM
 )
 from transformers import logging as hf_logging
 
@@ -51,12 +52,12 @@ def load_system():
     index = faiss.IndexFlatIP(embedding_dim)
     index.add(context_embeddings_np)
 
-    # Load Question Encoder and Generator
+    # Load Question Encoder and FLAN-T5 Generator
     question_tokenizer = DPRQuestionEncoderTokenizer.from_pretrained('facebook/dpr-question_encoder-single-nq-base')
     question_encoder = DPRQuestionEncoder.from_pretrained('facebook/dpr-question_encoder-single-nq-base', use_safetensors=True)
     
-    generator_tokenizer = AutoTokenizer.from_pretrained('gpt2')
-    generator_model = AutoModelForCausalLM.from_pretrained('gpt2', use_safetensors=True)
+    generator_tokenizer = AutoTokenizer.from_pretrained('google/flan-t5-base')
+    generator_model = AutoModelForSeq2SeqLM.from_pretrained('google/flan-t5-base', use_safetensors=True)
 
     return paragraphs, index, question_tokenizer, question_encoder, generator_tokenizer, generator_model
 
@@ -74,23 +75,39 @@ def search_relevant_contexts(question, k=5):
 
 def generate_answer(question, contexts):
     context_str = "\n".join(contexts)
-    input_text = f"Based on the following company policies:\n{context_str}\n\nQuestion: {question}\nAnswer:"
+    
+    # 1. Update the prompt to explicitly demand a comprehensive explanation
+    input_text = f"Based on the following company policies, provide a detailed and complete explanation to answer the user's question.\n\nContext: {context_str}\n\nQuestion: {question}\n\nDetailed Answer:"
     
     inputs = generator_tokenizer(input_text, return_tensors='pt', max_length=1024, truncation=True)
 
+    # 2. Add generation constraints to force longer, more detailed output
     summary_ids = generator_model.generate(
         inputs['input_ids'], 
-        max_new_tokens=60, 
-        length_penalty=1.0,
-        num_beams=4, 
-        no_repeat_ngram_size=2,
-        early_stopping=True,
-        pad_token_id=generator_tokenizer.eos_token_id
+        min_new_tokens=30,       # Forces the model to write at least 30 tokens
+        max_new_tokens=150,      # Gives it more room to expand
+        length_penalty=2.0,      # Heavily encourages longer text sequences
+        repetition_penalty=1.2,  # Prevents it from repeating the same phrase
+        early_stopping=True
     )
     
-    full_output = generator_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
-    answer_only = full_output.split("Answer:")[-1].strip()
-    return answer_only
+    return generator_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+
+def calculate_groundedness(answer, contexts):
+    context_text = " ".join(contexts).lower().translate(str.maketrans('', '', string.punctuation))
+    context_words = set(context_text.split())
+    
+    ans_text = answer.lower().translate(str.maketrans('', '', string.punctuation))
+    ans_words = ans_text.split()
+    
+    stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'to', 'and', 'or', 'in', 'on', 'at', 'by', 'for', 'with', 'about', 'as', 'of', 'this', 'that', 'it', 'be', 'from', 'has', 'have', 'will', 'not', 'no'}
+    ans_content_words = [w for w in ans_words if w not in stop_words]
+    
+    if not ans_content_words:
+        return 0.0
+        
+    supported_words = [w for w in ans_content_words if w in context_words]
+    return len(supported_words) / len(ans_content_words)
 
 # --- 4. User Interface ---
 st.markdown("Ask any question regarding internal company rules, and the AI will retrieve the relevant policy and generate an answer.")
@@ -111,10 +128,27 @@ if st.button("Search") and user_question:
         st.subheader("Answer:")
         st.success(answer)
         
+        # Evaluate Metrics
+        avg_retrieval_score = float(np.mean(D[0]))
+        groundedness_score = calculate_groundedness(answer, retrieved_contexts)
+        
+        st.divider()
+        st.subheader("Pipeline Diagnostics")
+        
+        # Use Streamlit layout columns for metrics
+        col1, col2, col3 = st.columns(3)
+        col1.metric(label="Retrieval Confidence (FAISS)", value=f"{avg_retrieval_score:.2f}")
+        col2.metric(label="Lexical Groundedness", value=f"{groundedness_score * 100:.1f}%")
+        
+        with col3:
+            if groundedness_score > 0.75:
+                st.success("Verdict: Highly Grounded ✅")
+            else:
+                st.warning("Verdict: Potential Hallucination ⚠️")
+        
         # Display Sources
         with st.expander("View Retrieved Policy Sources"):
             for i, context in enumerate(retrieved_contexts):
                 st.markdown(f"**Source {i+1}** (Confidence Score: {D[0][i]:.2f})")
                 st.write(context)
                 st.divider()
-
