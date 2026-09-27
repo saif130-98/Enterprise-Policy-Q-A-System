@@ -3,10 +3,11 @@ import torch
 import numpy as np
 import random
 import faiss
+import string
 from transformers import (
     DPRContextEncoder, DPRContextEncoderTokenizer,
     DPRQuestionEncoder, DPRQuestionEncoderTokenizer,
-    AutoTokenizer, AutoModelForCausalLM
+    AutoTokenizer, AutoModelForSeq2SeqLM
 )
 from transformers import logging as hf_logging
 
@@ -33,7 +34,6 @@ context_encoder = DPRContextEncoder.from_pretrained('facebook/dpr-ctx_encoder-si
 
 def encode_contexts(text_list):
     embeddings = []
-    # Added torch.no_grad() to prevent memory leaks during inference
     with torch.no_grad():
         for text in text_list:
             inputs = context_tokenizer(text, return_tensors='pt', padding=True, truncation=True, max_length=256)
@@ -48,62 +48,87 @@ context_embeddings_np = np.array(context_embeddings).astype('float32')
 
 # INITIALIZE AND POPULATE FAISS INDEX 
 embedding_dim = 768
-index = faiss.IndexFlatIP(embedding_dim) # Inner Product is best for DPR
+index = faiss.IndexFlatIP(embedding_dim) 
 index.add(context_embeddings_np)
 
 # 4. Load DPR Question Encoder
 question_encoder = DPRQuestionEncoder.from_pretrained('facebook/dpr-question_encoder-single-nq-base', use_safetensors=True)
 question_tokenizer = DPRQuestionEncoderTokenizer.from_pretrained('facebook/dpr-question_encoder-single-nq-base')
 
-# 5. Load Generative Model
-generator_tokenizer = AutoTokenizer.from_pretrained('gpt2')
-generator_model = AutoModelForCausalLM.from_pretrained('gpt2', use_safetensors=True)
+# 5. Load Generative Model (Swapped to FLAN-T5)
+generator_tokenizer = AutoTokenizer.from_pretrained('google/flan-t5-base')
+generator_model = AutoModelForSeq2SeqLM.from_pretrained('google/flan-t5-base', use_safetensors=True)
 
 def search_relevant_contexts(question, question_tokenizer, question_encoder, index, k=5):
     question_inputs = question_tokenizer(question, return_tensors='pt')
     with torch.no_grad():
         question_embedding = question_encoder(**question_inputs).pooler_output.detach().numpy()
     
-    # Search the index to retrieve top k relevant contexts
     D, I = index.search(question_embedding, k)
     return D, I
 
 def generate_answer(question, contexts):
-    # 1. Build a structured prompt so GPT-2 knows what to do
     context_str = "\n".join(contexts)
-    input_text = f"Based on the following company policies:\n{context_str}\n\nQuestion: {question}\nAnswer:"
+    
+    # 1. Update the prompt to explicitly demand a comprehensive explanation
+    input_text = f"Based on the following company policies, provide a detailed and complete explanation to answer the user's question.\n\nContext: {context_str}\n\nQuestion: {question}\n\nDetailed Answer:"
     
     inputs = generator_tokenizer(input_text, return_tensors='pt', max_length=1024, truncation=True)
 
-    # 2. Add anti-looping parameters (no_repeat_ngram_size)
+    # 2. Add generation constraints to force longer, more detailed output
     summary_ids = generator_model.generate(
         inputs['input_ids'], 
-        max_new_tokens=60, 
-        length_penalty=1.0,
-        num_beams=4, 
-        no_repeat_ngram_size=2, # This strictly prevents the model from looping
-        early_stopping=True,
-        pad_token_id=generator_tokenizer.eos_token_id
+        min_new_tokens=30,       # Forces the model to write at least 30 tokens
+        max_new_tokens=150,      # Gives it more room to expand
+        length_penalty=2.0,      # Heavily encourages longer text sequences
+        repetition_penalty=1.2,  # Prevents it from repeating the same phrase
+        early_stopping=True
     )
     
-    # 3. Decode and extract only the new generated text
-    full_output = generator_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
-    
-    # Split the output at "Answer:" and only return what the AI wrote
-    answer_only = full_output.split("Answer:")[-1].strip()
-    return answer_only
+    return generator_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
 
-# 6. Test the Pipeline
+# 6. Local Evaluation System
+def calculate_groundedness(answer, contexts):
+    """
+    Evaluates Faithfulness/Hallucination by checking what percentage of 
+    the generated content words actually exist in the retrieved policy chunks.
+    """
+    # Clean and tokenize contexts
+    context_text = " ".join(contexts).lower().translate(str.maketrans('', '', string.punctuation))
+    context_words = set(context_text.split())
+    
+    # Clean and tokenize answer
+    ans_text = answer.lower().translate(str.maketrans('', '', string.punctuation))
+    ans_words = ans_text.split()
+    
+    # Ignore common grammatical stop words
+    stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'to', 'and', 'or', 'in', 'on', 'at', 'by', 'for', 'with', 'about', 'as', 'of', 'this', 'that', 'it', 'be', 'from', 'has', 'have', 'will', 'not', 'no'}
+    ans_content_words = [w for w in ans_words if w not in stop_words]
+    
+    if not ans_content_words:
+        return 0.0
+        
+    # Calculate word overlap
+    supported_words = [w for w in ans_content_words if w in context_words]
+    return len(supported_words) / len(ans_content_words)
+
+# 7. Test and Evaluate the Pipeline
 question = 'tell me about Smoking Policy'
 D, I = search_relevant_contexts(question, question_tokenizer, question_encoder, index, k=5)
 
-print("\n--- Top 5 relevant contexts ---")
-retrieved_contexts = []
-for i, idx in enumerate(I[0]):
-    context = paragraphs[idx]
-    retrieved_contexts.append(context)
-    print(f"{i+1} (Score: {D[0][i]:.2f}): {context}\n")
+retrieved_contexts = [paragraphs[idx] for idx in I[0]]
+answer = generate_answer(question, retrieved_contexts)
+
+# Calculate Metrics
+avg_retrieval_score = float(np.mean(D[0]))
+groundedness_score = calculate_groundedness(answer, retrieved_contexts)
+
+# Output Results
+print(f"\n--- Evaluation Results ---")
+print(f"Question: '{question}'")
+print(f"Average FAISS Retrieval Confidence: {avg_retrieval_score:.2f}")
+print(f"Lexical Groundedness (Faithfulness): {groundedness_score * 100:.1f}%")
+print(f"Verdict: " + ("Highly Grounded ✅" if groundedness_score > 0.75 else "Potential Hallucination Detected ⚠️"))
 
 print("\n--- Generated Answer ---")
-answer = generate_answer(question, retrieved_contexts)
 print(answer)
